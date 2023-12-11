@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Nome do bucket S3 para upload de arquivos
+    Default: aula10-files-upload
+
+  DynamoDBTableName:
+    Type: String
+    Description: Nome da tabela do DynamoDB para armazenar informações sobre os arquivos
+    Default: FileUploads
+
+Resources:
+  FileUploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FileUploadApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: FileUploadApi
+      Description: API for file uploads
+      BinaryMediaTypes:
+        - multipart/form-data
+
+  FileUploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FileUploadApi
+      ParentId: !GetAtt FileUploadApi.RootResourceId
+      PathPart: upload
+
+  FileUploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FileUploadApi
+      ResourceId: !Ref FileUploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FileUploadLambda.Arn}/invocations
+
+  FileUploadDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - FileUploadMethod
+      - UploadFormMethod
+      - HomePageMethod
+    Properties:
+      RestApiId: !Ref FileUploadApi
+      StageName: prod
+
+  FileUploadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FileUploadLambda
+      Runtime: python3.8
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 30 
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import datetime
+          import base64
+          import boto3
+          from botocore.exceptions import ClientError
+
+          def parse_multipart_form_data(body, boundary):
+              # Divide o corpo da requisição em partes
+              parts = body.split(b"--" + boundary.encode())
+              for part in parts:
+                  if b"filename=" in part:
+                      # Encontrar o início e o fim do conteúdo do arquivo
+                      headers, file_content = part.split(b"\r\n\r\n", 1)
+                      file_content = file_content.rstrip(b"\r\n--")  # Remove o boundary final
+
+                      # Procura pelo nome do arquivo no cabeçalho
+                      file_name = None
+                      for header in headers.split(b"\r\n"):
+                          if b"filename=" in header:
+                              file_name = header.split(b"filename=")[1].strip().strip(b'"')
+
+                              # Decodificar file_name para string se não for None
+                              if file_name is not None:
+                                  file_name = file_name.decode('utf-8')
+
+                              break
+
+                      if file_name:
+                          return file_name, file_content
+
+              return None, None
+
+          def lambda_handler(event, context):
+              bucket_name = os.environ['S3_BUCKET']
+              table_name = os.environ['DYNAMODB_TABLE']
+
+              # Verifica se o corpo da requisição está codificado em Base64
+              is_base64_encoded = event.get("isBase64Encoded", False)
+
+              # Obtém o corpo da requisição
+              body = event["body"]
+              if is_base64_encoded:
+                  body = base64.b64decode(body)
+              else:
+                  body = body.encode('utf-8')  # Converte para bytes
+
+              # Extrai o boundary do cabeçalho 'content-type'
+              content_type = event["headers"]["content-type"]
+              boundary = content_type.split("boundary=")[-1]
+
+              # Extrai o conteúdo do arquivo da requisição
+              file_name, file_content = parse_multipart_form_data(body, boundary)
+              if file_content is None:
+                  return {"statusCode": 400, "body": "Arquivo não encontrado"}
+
+              # Salva o arquivo no S3
+              s3 = boto3.client('s3')
+
+              s3_client = boto3.client('s3')
+              try:
+                  response = s3_client.put_object(Bucket=bucket_name, Key=file_name, Body=file_content, ACL='public-read')
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Erro ao fazer upload para o bucket {bucket_name}: ' + str(e))
+                  }
+
+              # Insira informações sobre o arquivo no DynamoDB
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('FileUploads')
+              current_timestamp = int(datetime.datetime.now().timestamp())
+              
+              try:
+                  table.put_item(
+                      Item={
+                          'FileName': file_name,
+                          'UploadTimestamp': current_timestamp,
+                          'FileURL': f'https://{bucket_name}.s3.amazonaws.com/{file_name}'
+                      }
+                  )
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('Erro ao inserir informações no DynamoDB: ' + str(e))
+                  }
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Arquivo enviado com sucesso para: ' + file_name)
+              }
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref FileUploadBucket
+          DYNAMODB_TABLE: !Ref FileUploadsTable
+
+  FileUploadLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FileUploadLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  UploadFormLambda:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: UploadFormLambda
+        Runtime: python3.8
+        Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+        Handler: index.lambda_handler
+        Code:
+          ZipFile: |
+            import os
+
+            def lambda_handler(event, context):
+                api_gateway_url = os.environ['API_GATEWAY_URL']
+                html = f"""
+                <html>
+                <body>
+                <form action="{api_gateway_url}/upload" method="post" enctype="multipart/form-data">
+                    <input type="file" name="file" />
+                    <input type="submit" />
+                </form>
+                <br><a href="/prod/home">Voltar para a Homepage</a>
+                </body>
+                </html>
+                """
+                return {
+                    'statusCode': 200,
+                    'headers': { 'Content-Type': 'text/html' },
+                    'body': html
+                }
+        Environment:
+          Variables:
+            API_GATEWAY_URL: !Sub "https://${FileUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  UploadFormLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadFormLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  UploadFormResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FileUploadApi
+      ParentId: !GetAtt FileUploadApi.RootResourceId
+      PathPart: form
+
+  UploadFormMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FileUploadApi
+      ResourceId: !Ref UploadFormResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadFormLambda.Arn}/invocations
+
+  HomePageLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HomePageLambda
+      Runtime: python3.8
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import datetime
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              table_name = os.environ['DYNAMODB_TABLE']
+
+              try:
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(table_name)
+
+                  # Obtendo os últimos 20 registros
+                  response = table.scan(Limit=20)
+
+                  # Inicia a resposta HTML
+                  html_response = "<html><body><h1>Ultimos uploads (teste)</h1><ul>"
+
+                  # Itera sobre os registros, adicionando-os à resposta HTML
+                  for item in response.get('Items', []):
+                      file_name = item['FileName']
+                      upload_date = item['UploadTimestamp']
+                      formatted_date = datetime.datetime.fromtimestamp(upload_date).strftime('%Y-%m-%d %H:%M:%S')
+                      download_link = item['FileURL']
+
+                      html_response += f"<li>{formatted_date}: <a href='{download_link}'>{file_name}</a></li>"
+
+                  html_response += "</ul>"
+
+                  html_response += f"<br><a href='/prod/form'>Fazer novo upload</a>"
+
+                  html_response += "</ul></body></html>"
+
+                  return {
+                      "statusCode": 200,
+                      "headers": { "Content-Type": "text/html" },
+                      "body": html_response
+                  }
+
+              except ClientError as e:
+                  return {
+                      "statusCode": 500,
+                      "body": f"Erro ao acessar o DynamoDB: {str(e)}"
+                  }
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: FileUploads
+          API_GATEWAY_URL: !Sub "https://${FileUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  HomePageLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HomePageLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  HomePageResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FileUploadApi
+      ParentId: !GetAtt FileUploadApi.RootResourceId
+      PathPart: home
+
+  HomePageMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FileUploadApi
+      ResourceId: !Ref HomePageResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HomePageLambda.Arn}/invocations
+
+  FileUploadsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: FileName
+          AttributeType: S
+        - AttributeName: UploadTimestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: FileName
+          KeyType: HASH  # Chave de partição
+        - AttributeName: UploadTimestamp
+          KeyType: RANGE # Chave de ordenação
+      BillingMode: PAY_PER_REQUEST
+
+Outputs:
+  FileUploadApiEndpoint:
+    Description: "Endpoint for file upload"
+    Value: !Sub https://${FileUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload
+
+  FormEndpoint:
+    Description: "Endpoint for the upload form"
+    Value: !Sub https://${FileUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod/form
+
+  HomePageEndpoint:
+    Description: "Endpoint for the home page"
+    Value: !Sub https://${FileUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod/home
