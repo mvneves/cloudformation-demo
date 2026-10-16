@@ -3,27 +3,25 @@ AWSTemplateFormatVersion: '2010-09-09'
 Parameters:
   BucketName:
     Type: String
-    Description: Nome do bucket S3 para upload de arquivos
-    Default: aula10-files-upload
+    Description: >-
+      Nome do bucket S3 para upload de arquivos. Deve ser único no mundo (ex.: aula10-uploads-seunome).
+      Deixe em branco para o CloudFormation gerar um nome único automaticamente.
+    Default: ''
 
   DynamoDBTableName:
     Type: String
     Description: Nome da tabela do DynamoDB para armazenar informações sobre os arquivos
     Default: FileUploads
 
+Conditions:
+  HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+
 Resources:
+  # Bucket privado: os arquivos são acessados por URLs pré-assinadas geradas pela HomePageLambda
   FileUploadBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref BucketName
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: ObjectWriter
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: false
-        BlockPublicPolicy: false
-        IgnorePublicAcls: false
-        RestrictPublicBuckets: false
+      BucketName: !If [HasBucketName, !Ref BucketName, !Ref AWS::NoValue]
 
   FileUploadApi:
     Type: AWS::ApiGateway::RestApi
@@ -66,7 +64,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: FileUploadLambda
-      Runtime: python3.8
+      Runtime: python3.12
       Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
       Timeout: 30 
       Handler: index.lambda_handler
@@ -129,11 +127,9 @@ Resources:
                   return {"statusCode": 400, "body": "Arquivo não encontrado"}
 
               # Salva o arquivo no S3
-              s3 = boto3.client('s3')
-
               s3_client = boto3.client('s3')
               try:
-                  response = s3_client.put_object(Bucket=bucket_name, Key=file_name, Body=file_content, ACL='public-read')
+                  s3_client.put_object(Bucket=bucket_name, Key=file_name, Body=file_content)
               except ClientError as e:
                   return {
                       'statusCode': 500,
@@ -142,15 +138,14 @@ Resources:
 
               # Insira informações sobre o arquivo no DynamoDB
               dynamodb = boto3.resource('dynamodb')
-              table = dynamodb.Table('FileUploads')
+              table = dynamodb.Table(table_name)
               current_timestamp = int(datetime.datetime.now().timestamp())
-              
+
               try:
                   table.put_item(
                       Item={
                           'FileName': file_name,
-                          'UploadTimestamp': current_timestamp,
-                          'FileURL': f'https://{bucket_name}.s3.amazonaws.com/{file_name}'
+                          'UploadTimestamp': current_timestamp
                       }
                   )
               except ClientError as e:
@@ -179,7 +174,7 @@ Resources:
       Type: AWS::Lambda::Function
       Properties:
         FunctionName: UploadFormLambda
-        Runtime: python3.8
+        Runtime: python3.12
         Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
         Handler: index.lambda_handler
         Code:
@@ -238,7 +233,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: HomePageLambda
-      Runtime: python3.8
+      Runtime: python3.12
       Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
       Handler: index.lambda_handler
       Code:
@@ -250,8 +245,10 @@ Resources:
 
           def lambda_handler(event, context):
               table_name = os.environ['DYNAMODB_TABLE']
+              bucket_name = os.environ['S3_BUCKET']
 
               try:
+                  s3_client = boto3.client('s3')
                   dynamodb = boto3.resource('dynamodb')
                   table = dynamodb.Table(table_name)
 
@@ -266,7 +263,13 @@ Resources:
                       file_name = item['FileName']
                       upload_date = item['UploadTimestamp']
                       formatted_date = datetime.datetime.fromtimestamp(upload_date).strftime('%Y-%m-%d %H:%M:%S')
-                      download_link = item['FileURL']
+
+                      # O bucket é privado: gera uma URL pré-assinada, válida por 1 hora
+                      download_link = s3_client.generate_presigned_url(
+                          'get_object',
+                          Params={'Bucket': bucket_name, 'Key': file_name},
+                          ExpiresIn=3600
+                      )
 
                       html_response += f"<li>{formatted_date}: <a href='{download_link}'>{file_name}</a></li>"
 
@@ -289,7 +292,8 @@ Resources:
                   }
       Environment:
         Variables:
-          DYNAMODB_TABLE: FileUploads
+          DYNAMODB_TABLE: !Ref FileUploadsTable
+          S3_BUCKET: !Ref FileUploadBucket
           API_GATEWAY_URL: !Sub "https://${FileUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
 
   HomePageLambdaPermission:
@@ -335,6 +339,10 @@ Resources:
       BillingMode: PAY_PER_REQUEST
 
 Outputs:
+  BucketName:
+    Description: "Nome do bucket S3 onde os arquivos são armazenados"
+    Value: !Ref FileUploadBucket
+
   FileUploadApiEndpoint:
     Description: "Endpoint for file upload"
     Value: !Sub https://${FileUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload
